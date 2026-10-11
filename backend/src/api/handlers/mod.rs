@@ -307,6 +307,24 @@ pub(crate) mod test_db_helpers;
 #[cfg(test)]
 mod virtual_token_scope_tests;
 
+/// #4498: router-level tests that an unreadable repository answers exactly
+/// like a missing one on the REST read endpoints.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod repo_read_existence_tests;
+
+/// #4570: router-level tests that a Git LFS batch download action can be
+/// followed on a private repository.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod gitlfs_download_auth_tests;
+
+/// #4506: router-level tests that origin policies gate proxy-cache-only
+/// content of Remote repositories.
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod proxy_origin_policy_tests;
+
 pub mod admin;
 pub mod admin_security;
 pub mod age_gate;
