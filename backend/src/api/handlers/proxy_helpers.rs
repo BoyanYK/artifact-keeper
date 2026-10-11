@@ -21944,8 +21944,8 @@ mod scan_on_upload_coverage_tests {
         ("chef.rs", "upload_cookbook"),
         ("cocoapods.rs", "push_pod"),
         ("composer.rs", "upload"),
-        ("conan.rs", "recipe_file_upload"),
-        ("conan.rs", "package_file_upload"),
+        // Both Conan upload handlers insert through this helper (#4329).
+        ("conan.rs", "insert_conan_artifact"),
         ("gitlfs.rs", "upload_object"),
         ("goproxy.rs", "upload_zip"),
         ("goproxy.rs", "upload_mod"),
@@ -22273,8 +22273,8 @@ mod scan_on_upload_coverage_tests {
         ("chef.rs", "upload_cookbook"),
         ("cocoapods.rs", "push_pod"),
         ("composer.rs", "upload"),
-        ("conan.rs", "recipe_file_upload"),
-        ("conan.rs", "package_file_upload"),
+        // Both Conan upload handlers insert through this helper (#4329).
+        ("conan.rs", "insert_conan_artifact"),
         ("conda.rs", "store_conda_package"),
         ("cran.rs", "upload_package"),
         ("gitlfs.rs", "upload_object"),
