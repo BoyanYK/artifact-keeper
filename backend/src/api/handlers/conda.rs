@@ -2500,12 +2500,22 @@ const SHARDS_BASE_URL: &str = "./shards/";
 /// means by its `""`.
 const PACKAGES_BASE_URL: &str = "./";
 
-/// Ceiling on an upstream CEP-16 shard index, as served. conda-forge's
-/// largest subdir index is about 1 MiB; the 8 MiB default metadata tier keeps
-/// the reservation against the shared buffered-metadata budget (#2684) small,
-/// which matters because every shard request through a remote or virtual
-/// channel reads the (proxy-cached) index too.
+/// First-try ceiling on an upstream CEP-16 shard index, as served.
+/// conda-forge's largest subdir index is about 1 MiB; the 8 MiB default
+/// metadata tier keeps the reservation against the shared buffered-metadata
+/// budget (#2684) small, which matters because every shard request through a
+/// remote or virtual channel reads the (proxy-cached) index too. An index past
+/// it is read again under [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`].
 const CEP16_UPSTREAM_INDEX_MAX_BYTES: usize = proxy_helpers::DEFAULT_METADATA_MAX_BYTES;
+
+/// Ceiling on an upstream CEP-16 shard index that does not fit the first try
+/// (#4612). conda-pypi's noarch index, 701,089 names, is 28.6 MB compressed;
+/// 64 MiB leaves more than twice that. Only an index past the first-try tier
+/// reserves this much of the budget, so channels with ordinary indexes keep
+/// the small reservation. An index past this ceiling is treated as the
+/// upstream publishing no usable shard index: the reason is logged and the
+/// client is sent to `repodata.json`, never a 502.
+const CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Ceiling on one upstream CEP-16 shard, as served (#4607). Measured
 /// 2026-10-10: the largest conda-forge shards are `linux-64/awscli` (848,228
@@ -2522,8 +2532,11 @@ const CEP16_UPSTREAM_SHARD_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Ceiling on an upstream CEP-16 shard index after undoing the zstd frame
 /// (and any transfer coding), so a crafted frame stops at the cap instead of
 /// at the allocator. conda-forge's largest subdir index decodes to a few MiB;
-/// conda-pypi's noarch index, 701,089 names, to 34 MB.
-const CEP16_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+/// conda-pypi's noarch index, 701,089 names, to 34 MB (1.2 times its
+/// compressed size, since the 32-byte addresses do not compress). Twice
+/// [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`], so an index the fetch admits is
+/// not refused for decoding to a little more (#4612).
+const CEP16_MAX_DECODED_BYTES: usize = 2 * CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES;
 
 /// How far the record-name check on a shard served through a virtual
 /// ([`shard_record_names`]) reads into the decoded shard before giving up.
@@ -2638,10 +2651,11 @@ struct UpstreamShardIndexInfo {
 /// Fetch and decode `{subdir}/repodata_shards.msgpack.zst` from a remote
 /// repository's upstream through the proxy cache (capped and budgeted, like a
 /// virtual member's repodata). `Ok(None)`: the upstream answers 404, i.e. it
-/// does not publish CEP-16 for this subdir (negative-cached by the proxy). Any
-/// other failure is reported as that repository's
-/// [`virtual_merge::MemberFailure`], so the virtual merge can apply its
-/// member-failure policy to it.
+/// does not publish CEP-16 for this subdir (negative-cached by the proxy), or
+/// its index is past [`CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES`] (#4612, logged);
+/// either way the client uses `repodata.json`. Any other failure is reported
+/// as that repository's [`virtual_merge::MemberFailure`], so the virtual merge
+/// can apply its member-failure policy to it.
 async fn fetch_upstream_shard_document<T>(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -2658,15 +2672,22 @@ where
         reason,
     };
     let path = format!("{subdir}/{SHARD_INDEX_FILE}");
-    let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
-        proxy,
-        repo_id,
-        repo_key,
-        upstream_url,
-        &path,
-        CEP16_UPSTREAM_INDEX_MAX_BYTES,
-    )
-    .await;
+    // Most indexes fit the small first-try reservation; only one past it is
+    // read again under the large ceiling (#4612).
+    let fetch = |cap| {
+        proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+            proxy,
+            repo_id,
+            repo_key,
+            upstream_url,
+            &path,
+            cap,
+        )
+    };
+    let mut fetched = fetch(CEP16_UPSTREAM_INDEX_MAX_BYTES).await;
+    if matches!(fetched, Ok(proxy_helpers::CappedMetadataGet::OverCap)) {
+        fetched = fetch(CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES).await;
+    }
     let (content, content_encoding, budget_permit) = match fetched {
         Ok(proxy_helpers::CappedMetadataGet::Buffered {
             content,
@@ -2675,10 +2696,17 @@ where
             ..
         }) => (content, content_encoding, budget_permit),
         Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
-            return Err(fail(
-                "cap",
-                format!("{path} exceeds the {CEP16_UPSTREAM_INDEX_MAX_BYTES}-byte ceiling"),
-            ));
+            // Not a member failure: the upstream publishes an index too large
+            // to buffer, so it publishes no index this channel can use, and
+            // the client falls back to `repodata.json` like for a 404 (#4612).
+            tracing::warn!(
+                repo = %repo_key,
+                document = %path,
+                ceiling = CEP16_UPSTREAM_INDEX_LARGE_MAX_BYTES,
+                "upstream CEP-16 shard index exceeds the shard-index ceiling; serving no \
+                 shard index for it so clients use repodata.json"
+            );
+            return Ok(None);
         }
         Err(response) if response.status() == StatusCode::NOT_FOUND => return Ok(None),
         Err(response) => {
@@ -4662,8 +4690,10 @@ async fn build_virtual_repodata(
 
 /// Build merged channeldata.json for a virtual repository: hosted members
 /// first, then remote members (fetched capped, one at a time), with remote
-/// entries for hosted-owned names excluded. Shared and kept like repodata
-/// ([`merge_gate`], #4608).
+/// entries for hosted-owned names excluded. A remote member whose upstream
+/// publishes no channeldata.json (404) contributes no entries (#4601); any
+/// other member failure goes through the member-failure policy. Shared and
+/// kept like repodata ([`merge_gate`], #4608).
 async fn build_virtual_channeldata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -4729,12 +4759,15 @@ async fn build_virtual_channeldata(
             Some(format!("{virtual_repo_id}/channeldata.json")),
             move |doc| merge_validators_fresh(validate_proxy, doc),
             move |mut account| async move {
+                // A member whose upstream publishes no channeldata.json (404)
+                // contributes no entries; only a real failure (5xx, timeout,
+                // cap, parse) fails the merge (#4601).
                 let (documents, mut failed) = virtual_merge::fetch_remote_members(
                     proxy.as_deref(),
                     &members,
                     &virtual_merge::channeldata_candidates(),
                     virtual_merge::MemberLimits::from_env(),
-                    false,
+                    true,
                     &mut account,
                 )
                 .await;
@@ -4793,7 +4826,7 @@ async fn build_virtual_channeldata(
 /// Serve a virtual merge under the repository's member-failure policy
 /// (#4192): strict by default (502 naming the failed members), or a degraded
 /// document marked partial and uncacheable when the virtual opts in through
-/// `repository_config` key [`virtual_merge::PARTIAL_CONFIG_KEY`].
+/// `repository_config` key [`proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`].
 ///
 /// The body, its ETag and (for JSON) its gzip rendering come from the shared
 /// merged document, so every request a merge answers gets the same bytes and
@@ -5265,12 +5298,15 @@ impl proxy_helpers::ScannedProxyFile for CondaScannedPackage<'_> {
     }
 
     /// The `name@version` the file name requests, pinned only when the
-    /// package's own `info/index.json` agrees (#3003, #4039). The engine must
-    /// then actually grade that coordinate before a clean verdict counts; a
-    /// noarch Python package is graded through the `.dist-info` it installs.
-    /// A file name that does not parse, or bytes whose index disagrees or
-    /// cannot be read, are not what they are served as: inconclusive (423
-    /// under fail-closed, served `pending` and not scanned under fail-open).
+    /// package's own `info/index.json` agrees (#3003, #4039). This check is
+    /// what ties the verdict to the identity being served: the engine grades
+    /// a conda package's contents, so a completed scan is graded on its
+    /// findings whether it cataloged the package itself (a noarch Python
+    /// package's `.dist-info`), the upstream component a compiled package
+    /// vendors, or nothing (#4594, #4600). A file name that does not parse,
+    /// or bytes whose index disagrees or cannot be read, are not what they
+    /// are served as: inconclusive (423 under fail-closed, served `pending`
+    /// and not scanned under fail-open).
     fn identity(
         &self,
         req: &proxy_helpers::ScannedProxyRequest<'_>,
@@ -18434,7 +18470,7 @@ mod virtual_channel_tests {
             "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, 'true')",
         )
         .bind(rig.virtual_id)
-        .bind(virtual_merge::PARTIAL_CONFIG_KEY)
+        .bind(proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
         .execute(&rig.pool)
         .await
         .unwrap();
@@ -18453,7 +18489,7 @@ mod virtual_channel_tests {
         assert_eq!(listed(&doc), vec!["acme-core-1.0-0.conda"]);
         assert_eq!(
             headers
-                .get(virtual_merge::PARTIAL_MEMBERS_HEADER)
+                .get(proxy_helpers::PARTIAL_MEMBERS_HEADER)
                 .and_then(|v| v.to_str().ok()),
             Some(remote_key.as_str())
         );
@@ -18462,6 +18498,66 @@ mod virtual_channel_tests {
             Some("no-store")
         );
         assert!(headers.get("warning").is_some());
+    }
+
+    /// #4601: a remote member whose upstream publishes no `channeldata.json`
+    /// (404) contributes no entries instead of failing the virtual's
+    /// channeldata with 502. `repodata.json` for the same virtual merged fine
+    /// before the fix too.
+    #[tokio::test]
+    async fn member_without_channeldata_contributes_nothing_4601() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(upstream_repodata("noarch", &["rich-13.0-pyh_0.conda"])),
+            )
+            .mount(&server)
+            .await;
+        // No channeldata.json mounted: the upstream answers 404 for it.
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let (status, body, _) = rig
+            .get(format!("/{}/channeldata.json", rig.virtual_key))
+            .await;
+        let (repodata_status, _) = rig.repodata("noarch").await;
+        rig.cleanup().await;
+
+        assert_eq!(repodata_status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(doc["packages"].get("acme-core").is_some(), "{doc}");
+    }
+
+    /// #4601 acceptance: a hosted member with no packages and a remote member
+    /// that publishes channeldata merge to the remote's entries.
+    #[tokio::test]
+    async fn empty_hosted_member_and_remote_channeldata_merge_4601() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/channeldata.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "channeldata_version": 1,
+                "packages": {"rich": {"version": "13.0", "subdirs": ["noarch"]}},
+            })))
+            .mount(&server)
+            .await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        let (status, body, _) = rig
+            .get(format!("/{}/channeldata.json", rig.virtual_key))
+            .await;
+        rig.cleanup().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(doc["packages"]["rich"]["version"], "13.0", "{doc}");
     }
 
     #[test]
@@ -19924,33 +20020,61 @@ mod scan_on_proxy_tests {
         }
     }
 
-    /// #4594 keeps the identity check: when the scanner DID catalog a
-    /// `name@version` and it is not the one the file name requests, the scan
-    /// is inconclusive (423 under fail-closed) and nothing is recorded.
+    /// #4600: a compiled conda package the scanner catalogs only under the
+    /// upstream component it vendors (`libzlib` cataloged as `zlib`) is graded
+    /// on its findings, like an empty catalog (#4594): with none it is
+    /// `clean`, stored with the count of what was cataloged. Before #4600 the
+    /// identity check withheld it (423 under `fail_closed`, nothing stored).
     #[tokio::test]
-    async fn remote_cataloged_mismatch_is_still_withheld_4594() {
-        let file = "tzdata-2026c-h151e31d_0.conda";
-        let bytes = conda_v2("tzdata", "2026c");
+    async fn remote_vendored_catalog_is_graded_on_findings_4600() {
+        let file = "libzlib-1.3.1-hb9d3cd8_2.conda";
+        let bytes = conda_v2("libzlib", "1.3.1");
         let server = MockServer::start().await;
         mount_package(&server, file, &bytes).await;
         let (scanner, scans) = VersionedCveScanner::counting(
-            Some("grype-4594-test"),
-            MockCveRescan::Cataloged("evil", "6.6.6"),
+            Some("grype-4600-test"),
+            MockCveRescan::Cataloged("zlib", "1.3.1"),
         );
         let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await else {
             return;
         };
         configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", Some("high")).await;
         let digest = digest_of(&bytes);
-        let (status, body, _) = rig.get(&format!("noarch/{file}")).await;
+        let (status, body, headers) = rig.get(&format!("noarch/{file}")).await;
         let stored = stored_verdict(&rig.fx.pool, &digest).await;
         rig.teardown(std::slice::from_ref(&digest)).await;
 
-        assert_eq!(status, StatusCode::LOCKED);
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "scan_pending");
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(headers["X-AK-Scan"], "clean");
+        assert_eq!(&body[..], &bytes[..]);
         assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(stored, None);
+        assert_eq!(stored, Some(("clean".to_string(), Some(1))));
+    }
+
+    /// #4600: the same vendored-only catalog WITH a high finding is
+    /// `vulnerable` and blocked, and the verdict is recorded.
+    #[tokio::test]
+    async fn remote_vendored_catalog_with_a_finding_is_blocked_4600() {
+        let file = "libzlib-1.3.0-hb9d3cd8_2.conda";
+        let bytes = conda_v2("libzlib", "1.3.0");
+        let server = MockServer::start().await;
+        mount_package(&server, file, &bytes).await;
+        let (scanner, scans) = VersionedCveScanner::counting(
+            Some("grype-4600-test"),
+            MockCveRescan::CatalogedVulnerable("zlib", "1.3.0"),
+        );
+        let Some(rig) = RemoteRig::new(&server.uri(), Some(vec![Arc::new(scanner)])).await else {
+            return;
+        };
+        configure_scan(&rig.fx.pool, rig.fx.repo_id, "fail_closed", Some("high")).await;
+        let digest = digest_of(&bytes);
+        let (status, body, headers) = rig.get(&format!("noarch/{file}")).await;
+        let stored = stored_verdict(&rig.fx.pool, &digest).await;
+        rig.teardown(std::slice::from_ref(&digest)).await;
+
+        assert_scan_blocked(status, &body, &headers, file);
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(stored, Some(("vulnerable".to_string(), Some(1))));
     }
 
     /// Repodata is not gated: a fail-closed scanning remote still serves its
@@ -21182,6 +21306,87 @@ mod cep16_proxy_tests {
         );
     }
 
+    /// #4612: an upstream shard index past the 8 MiB metadata tier but under
+    /// the shard-index ceiling is served. conda-pypi's noarch index is 28.6 MB
+    /// compressed; this one is about 11 MB, with incompressible addresses so
+    /// the compressed size really is past the tier.
+    #[tokio::test]
+    async fn remote_serves_a_shard_index_past_the_metadata_tier_4612() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        const NAMES: u32 = 300_000;
+        let shards: Vec<(String, String)> = (0..NAMES)
+            .map(|i| {
+                (
+                    format!("pkg-{i:06}"),
+                    hex::encode(Sha256::digest(i.to_le_bytes())),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = shards
+            .iter()
+            .map(|(n, h)| (n.as_str(), h.as_str()))
+            .collect();
+        let index = upstream_index("noarch", "./shards/", &refs);
+        assert!(
+            index.len() > proxy_helpers::DEFAULT_METADATA_MAX_BYTES
+                && index.len() < 64 * 1024 * 1024,
+            "fixture index is {} bytes",
+            index.len()
+        );
+        let server = MockServer::start().await;
+        mount_bytes(&server, INDEX, index).await;
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(router(), state),
+            tdh::get(format!("/{repo_key}{INDEX}")),
+        )
+        .await;
+        cleanup_conda_repo(&pool, repo_id).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body[..body.len().min(512)])
+        );
+        assert_eq!(decode_index(&body).shards.len(), NAMES as usize);
+    }
+
+    /// #4612: an upstream shard index past the shard-index ceiling is not a
+    /// 502. The member is treated as publishing no usable index (the reason
+    /// is logged), so the remote answers 404 and a virtual over it answers
+    /// 404 too, and clients fall back to `repodata.json`.
+    #[tokio::test]
+    async fn shard_index_over_the_ceiling_falls_back_to_repodata_4612() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        mount_bytes(&server, INDEX, vec![0x5a; 65 * 1024 * 1024]).await;
+        let (state, _cache) = state_with_proxy_cache(&pool);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+        let (remote_status, remote_body) = tdh::send(
+            tdh::router_anon(router(), state),
+            tdh::get(format!("/{repo_key}{INDEX}")),
+        )
+        .await;
+        cleanup_conda_repo(&pool, repo_id).await;
+        let rig = VirtualRig::new(pool, &server.uri()).await;
+        seed_hosted_record(&rig.pool, rig.hosted_id, "noarch", "acme-core-1.0-0.conda").await;
+        let (virtual_status, virtual_body, _) =
+            rig.get(format!("/{}{INDEX}", rig.virtual_key)).await;
+        rig.cleanup().await;
+
+        let remote_body = String::from_utf8_lossy(&remote_body);
+        assert_eq!(remote_status, StatusCode::NOT_FOUND, "{remote_body}");
+        assert!(remote_body.contains("repodata.json"), "{remote_body}");
+        let virtual_body = String::from_utf8_lossy(&virtual_body);
+        assert_eq!(virtual_status, StatusCode::NOT_FOUND, "{virtual_body}");
+        assert!(virtual_body.contains("repodata.json"), "{virtual_body}");
+    }
+
     /// A member whose index FETCH fails is handled like a failed repodata
     /// member (#4192): 502 naming it by default, a partial index marked as
     /// such when the virtual opts in. Hosted shards stay served either way.
@@ -21219,7 +21424,7 @@ mod cep16_proxy_tests {
             "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, 'true')",
         )
         .bind(rig.virtual_id)
-        .bind(virtual_merge::PARTIAL_CONFIG_KEY)
+        .bind(proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
         .execute(&rig.pool)
         .await
         .unwrap();
@@ -21243,7 +21448,7 @@ mod cep16_proxy_tests {
         assert_eq!(partial_status, StatusCode::OK);
         assert_eq!(
             partial_headers
-                .get(virtual_merge::PARTIAL_MEMBERS_HEADER)
+                .get(proxy_helpers::PARTIAL_MEMBERS_HEADER)
                 .and_then(|h| h.to_str().ok()),
             Some(remote_key.as_str())
         );

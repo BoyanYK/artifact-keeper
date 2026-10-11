@@ -3650,17 +3650,30 @@ where
             // The cache-keyed fetch is `proxy_fetch` with `fetch_path ==
             // cache_path`, widened to also report the upstream
             // `Content-Encoding` (#3260) and `Content-Type` (#3281) so the
-            // transform can re-declare them.
-            match proxy_fetch_with_cache_key(
+            // transform can re-declare them. Bounded by the member deadline
+            // (#4508): a member that misses it ends the walk with a 502
+            // naming it rather than holding every miss for the upstream's
+            // own timeout or silently answering from a lower-priority member.
+            let fetched = within_virtual_member_deadline(proxy_fetch_with_cache_key(
                 proxy,
                 member.id,
                 &member.key,
                 upstream_url,
                 path,
                 path,
-            )
-            .await
-            {
+            ))
+            .await;
+            let fetched = match fetched {
+                Ok(fetched) => fetched,
+                Err(deadline) => {
+                    return MemberResolveOutcome::Quarantine(virtual_member_deadline_response(
+                        &member.key,
+                        path,
+                        deadline,
+                    ));
+                }
+            };
+            match fetched {
                 Ok((bytes, ct, enc)) => match transform(bytes, ct, enc, member.key.clone()).await {
                     Ok(response) => MemberResolveOutcome::Hit(response),
                     Err(_) => {
@@ -3701,13 +3714,311 @@ where
     }
 }
 
+/// Environment variable bounding, in seconds, how long one Remote member of a
+/// virtual repository may take to answer a metadata fetch (#4508).
+pub const VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV: &str = "AK_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS";
+
+/// Default member deadline. The upstream client's connect and read timeouts
+/// are 60 s each, which is also what most reverse proxies allow a whole
+/// request, so a member whose upstream is down (connections blackholed, not
+/// refused) used to hold every miss past the proxy's timeout and the client
+/// saw 504. 20 s is far above a healthy metadata fetch and well under that.
+pub const DEFAULT_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS: u64 = 20;
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only override of [`virtual_member_metadata_timeout`] for the
+    /// requests a test drives (see [`with_virtual_member_deadline`]).
+    static VIRTUAL_MEMBER_DEADLINE_OVERRIDE: std::time::Duration;
+}
+
+/// The member deadline: [`VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV`], or
+/// [`DEFAULT_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS`] when it is unset, not a
+/// number or zero (zero would fail every member, never disable the bound).
+pub fn virtual_member_metadata_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(deadline) = VIRTUAL_MEMBER_DEADLINE_OVERRIDE.try_with(|d| *d) {
+        return deadline;
+    }
+    static DEADLINE: OnceLock<std::time::Duration> = OnceLock::new();
+    *DEADLINE.get_or_init(|| {
+        let secs = std::env::var(VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_VIRTUAL_MEMBER_METADATA_TIMEOUT_SECS);
+        std::time::Duration::from_secs(secs)
+    })
+}
+
+/// Run `fut` with the member deadline set to `deadline` for every member
+/// fetch it makes on this task. Test-only.
+#[cfg(test)]
+pub(crate) async fn with_virtual_member_deadline<F: std::future::Future>(
+    deadline: std::time::Duration,
+    fut: F,
+) -> F::Output {
+    VIRTUAL_MEMBER_DEADLINE_OVERRIDE.scope(deadline, fut).await
+}
+
+/// Run one virtual member's metadata fetch under the member deadline
+/// (#4508). `Err` carries the deadline it missed.
+pub async fn within_virtual_member_deadline<F: std::future::Future>(
+    fut: F,
+) -> Result<F::Output, std::time::Duration> {
+    let deadline = virtual_member_metadata_timeout();
+    tokio::time::timeout(deadline, fut)
+        .await
+        .map_err(|_| deadline)
+}
+
+/// [`proxy_fetch_capped_budgeted`] for one virtual member's metadata, bounded
+/// by the member deadline (#4508). The budget reservation is waited for
+/// first and only the upstream fetch is timed, so a saturated buffered-metadata
+/// budget is never reported as the member being down. `Err` carries the
+/// deadline the fetch missed.
+pub async fn member_metadata_fetch_capped_budgeted(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response>, std::time::Duration> {
+    let permit = proxy_metadata_budget().reserve(max).await;
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    let fetched =
+        within_virtual_member_deadline(proxy_service.fetch_artifact_capped(&repo, path, max))
+            .await?;
+    Ok(fetched
+        .map(|(content, content_type)| (content, content_type, permit))
+        .map_err(|e| map_proxy_error(repo_key, path, e)))
+}
+
+/// Why a member that missed the deadline contributed nothing, for a 502 body.
+pub fn virtual_member_deadline_reason(path: &str, deadline: std::time::Duration) -> String {
+    format!(
+        "{path}: no answer within {}s ({VIRTUAL_MEMBER_METADATA_TIMEOUT_ENV}); the upstream \
+         may be down",
+        deadline.as_secs_f64()
+    )
+}
+
+/// The 502 a virtual metadata request answers when `member` misses the
+/// member deadline (#4508): fail promptly and name the member, instead of
+/// holding the request for the upstream's own timeout.
+pub fn virtual_member_deadline_response(
+    member: &str,
+    path: &str,
+    deadline: std::time::Duration,
+) -> Response {
+    metrics::counter!(
+        "ak_virtual_member_metadata_timeouts_total",
+        "member" => member.to_string(),
+    )
+    .increment(1);
+    tracing::warn!(
+        member = %member,
+        path = %path,
+        deadline_secs = deadline.as_secs_f64(),
+        "virtual member did not answer a metadata fetch within the member deadline"
+    );
+    (
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "Virtual repository member '{member}' failed: {}",
+            virtual_member_deadline_reason(path, deadline)
+        ),
+    )
+        .into_response()
+}
+
+/// `repository_config` key on a VIRTUAL repository that opts it into degraded
+/// metadata merges (#4192): `true` serves the merge of the members that
+/// succeeded, marked partial and uncacheable. Absent or anything else:
+/// strict, i.e. any member failure fails the request with 502. Shared by
+/// [`collect_virtual_metadata`] and the conda virtual merge.
+pub const VIRTUAL_METADATA_PARTIAL_CONFIG_KEY: &str = "virtual_metadata_partial";
+
+/// Response header naming the members a degraded merge left out (#4192).
+pub const PARTIAL_MEMBERS_HEADER: &str = "x-ak-partial-members";
+
+/// Whether `value` (the stored [`VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`]) opts
+/// a virtual into partial merges.
+pub fn virtual_metadata_partial_opted_in(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some(v) if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("allow")
+    )
+}
+
+/// Read whether `virtual_repo_id` opted into partial merges. A failed read is
+/// strict: the lookup failing must not loosen the guarantee.
+pub async fn virtual_metadata_partial_allowed(db: &PgPool, virtual_repo_id: Uuid) -> bool {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(virtual_repo_id)
+    .bind(VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
+    .fetch_optional(db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "reading {VIRTUAL_METADATA_PARTIAL_CONFIG_KEY} failed; using strict");
+        None
+    });
+    virtual_metadata_partial_opted_in(value.as_deref())
+}
+
+/// Mark a degraded merged response: name the missing members, forbid caching
+/// (a partial document must never be cached as the complete one) and add a
+/// `Warning: 199`.
+pub fn mark_partial_metadata_response(response: &mut Response, missing: &str) {
+    use axum::http::header::{CACHE_CONTROL, ETAG, WARNING};
+    use axum::http::HeaderValue;
+    let headers = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(missing) {
+        headers.insert(PARTIAL_MEMBERS_HEADER, v);
+    }
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.remove(ETAG);
+    if let Ok(v) = HeaderValue::from_str(&format!(
+        "199 - \"partial merge: members {missing} are missing\""
+    )) {
+        headers.insert(WARNING, v);
+    }
+}
+
+/// Why one Remote member of a virtual contributed nothing to a merged
+/// metadata document (#4192).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualMemberFailure {
+    /// The member repository's key.
+    pub member: String,
+    /// Stable, low-cardinality class for the failure metric: `fetch`,
+    /// `parse` or `timeout` (the member deadline, #4508).
+    pub kind: &'static str,
+    /// What went wrong, phrased for an operator reading a 502 body.
+    pub reason: String,
+}
+
+/// The members a merged metadata document left out, when the virtual opted
+/// into partial merges (#4192). Empty for a complete merge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use = "a partial merge must be marked on the response it is served as"]
+pub struct PartialMerge(Option<String>);
+
+impl PartialMerge {
+    /// The comma-separated member keys left out, if any.
+    pub fn missing(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// Mark `response` as partial and uncacheable when members are missing.
+    pub fn mark(&self, response: &mut Response) {
+        if let Some(missing) = &self.0 {
+            mark_partial_metadata_response(response, missing);
+        }
+    }
+
+    /// [`Self::mark`] on a handler result's success arm.
+    pub fn apply(&self, result: Result<Response, Response>) -> Result<Response, Response> {
+        result.map(|mut response| {
+            self.mark(&mut response);
+            response
+        })
+    }
+}
+
+/// What [`collect_virtual_metadata`] gathered: each contributing member's
+/// extracted document in member order, and the members a degraded merge left
+/// out, which the caller marks on the response it builds.
+#[derive(Debug)]
+pub struct VirtualMetadata<T> {
+    pub documents: Vec<(String, T)>,
+    pub partial: PartialMerge,
+}
+
+/// Count every member failure and turn the outcome into what the virtual's
+/// policy calls for (#4192): nothing missing, a partial merge naming the
+/// members (opted in), or the strict 502 naming each member and its cause.
+async fn apply_virtual_member_failures(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    format: &str,
+    path: &str,
+    failed: &[VirtualMemberFailure],
+) -> Result<PartialMerge, Response> {
+    if failed.is_empty() {
+        return Ok(PartialMerge::default());
+    }
+    let virtual_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+        .bind(virtual_repo_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| virtual_repo_id.to_string());
+    let allow_partial = virtual_metadata_partial_allowed(db, virtual_repo_id).await;
+    for f in failed {
+        metrics::counter!(
+            "ak_virtual_member_metadata_failures_total",
+            "format" => format.to_string(),
+            "virtual_repo" => virtual_key.clone(),
+            "member" => f.member.clone(),
+            "reason" => f.kind,
+        )
+        .increment(1);
+        tracing::warn!(
+            virtual_repo = %virtual_key,
+            member = %f.member,
+            path = %path,
+            kind = f.kind,
+            reason = %f.reason,
+            allow_partial,
+            "virtual member could not contribute to the merged metadata document"
+        );
+    }
+    if allow_partial {
+        return Ok(PartialMerge(Some(
+            failed
+                .iter()
+                .map(|f| f.member.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        )));
+    }
+    let detail = failed
+        .iter()
+        .map(|f| format!("member '{}' failed: {}", f.member, f.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!("Virtual repository '{virtual_key}' cannot serve {path}: {detail}"),
+    )
+        .into_response())
+}
+
 /// Collect metadata from ALL remote members of a virtual repository.
 /// Each member's response is extracted via the `extract` closure and
-/// gathered into a `Vec<(repo_key, T)>`. The caller is responsible for
-/// merging the collected results.
+/// gathered, in member order, for the caller to merge.
 ///
 /// Suitable for metadata endpoints where responses from every upstream
-/// must be combined (conda repodata, cran PACKAGES, helm index, rubygems specs).
+/// must be combined (cran PACKAGES, helm index, hex names/versions, bazel
+/// module metadata).
+///
+/// A member that fails to fetch or whose document does not extract fails the
+/// merge loudly (#4192): by default the request is a 502 naming each failed
+/// member and the cause, because a merged index that silently lacks a member
+/// makes the client conclude its packages do not exist (or resolve a name
+/// present in two members to the lower-priority one). A virtual that opted in
+/// through [`VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`] gets the merge of the
+/// members that succeeded and a [`PartialMerge`] the caller marks on its
+/// response. Either way each failure counts in
+/// `ak_virtual_member_metadata_failures_total`. A member that answers 404
+/// publishes no such document: it contributes nothing and is not a failure.
+/// Members the caller may not read are not members here at all (#3323).
 ///
 /// Deliberately DROPS the upstream `Content-Encoding` (#3260): every `extract`
 /// closure PARSES the member body and the caller serves a merged document it
@@ -3726,7 +4037,7 @@ pub async fn collect_virtual_metadata<T, F, Fut>(
     virtual_repo_id: Uuid,
     path: &str,
     extract: F,
-) -> Result<Vec<(String, T)>, Response>
+) -> Result<VirtualMetadata<T>, Response>
 where
     F: Fn(Bytes, String) -> Fut,
     Fut: std::future::Future<Output = Result<T, Response>>,
@@ -3744,40 +4055,74 @@ where
         .iter()
         .filter(|m| m.repo_type == RepositoryType::Remote)
         .collect();
-    let mut results: Vec<(String, T)> = Vec::new();
+    let format = remote_members
+        .first()
+        .map(|m| m.format.as_key())
+        .unwrap_or("unknown");
+    let mut documents: Vec<(String, T)> = Vec::new();
+    let mut failed: Vec<VirtualMemberFailure> = Vec::new();
     for chunk in remote_members.chunks(MAX_VIRTUAL_FANOUT) {
         let batch = futures::future::join_all(chunk.iter().copied().map(|member| async move {
-            let (Some(proxy), Some(upstream_url)) = (proxy_service, member.upstream_url.as_deref())
-            else {
-                return None;
+            let fail = |kind: &'static str, reason: String| {
+                Some(Err(VirtualMemberFailure {
+                    member: member.key.clone(),
+                    kind,
+                    reason,
+                }))
             };
-            match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
-                Ok((bytes, _ct)) => match extract(bytes, member.key.clone()).await {
-                    Ok(data) => Some((member.key.clone(), data)),
-                    Err(_) => {
-                        tracing::warn!(
-                            member = %member.key,
-                            path = %path,
-                            "virtual metadata extract failed for member response"
-                        );
-                        None
-                    }
-                },
-                Err(_) => {
-                    tracing::warn!(
-                        member = %member.key,
-                        path = %path,
-                        "virtual metadata proxy fetch failed for member"
-                    );
-                    None
+            let Some(proxy) = proxy_service else {
+                return fail("fetch", "the proxy service is not available".to_string());
+            };
+            let Some(upstream_url) = member.upstream_url.as_deref() else {
+                return fail("fetch", "remote member has no upstream URL".to_string());
+            };
+            // Bounded by the member deadline (#4508): a member whose upstream
+            // is down must not hold the merge for the upstream's own timeout.
+            let fetched = match within_virtual_member_deadline(proxy_fetch(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                path,
+            ))
+            .await
+            {
+                Ok(fetched) => fetched,
+                Err(deadline) => {
+                    return fail("timeout", virtual_member_deadline_reason(path, deadline));
                 }
+            };
+            match fetched {
+                Ok((bytes, _ct)) => match extract(bytes, member.key.clone()).await {
+                    Ok(data) => Some(Ok((member.key.clone(), data))),
+                    Err(response) => fail(
+                        "parse",
+                        format!(
+                            "{path}: the upstream document could not be read ({})",
+                            response.status()
+                        ),
+                    ),
+                },
+                // The member publishes no such document: nothing to merge,
+                // and nothing missing from the merge either.
+                Err(response) if response.status() == StatusCode::NOT_FOUND => None,
+                Err(response) => fail(
+                    "fetch",
+                    format!("{path}: upstream fetch failed with {}", response.status()),
+                ),
             }
         }))
         .await;
-        results.extend(batch.into_iter().flatten());
+        for outcome in batch.into_iter().flatten() {
+            match outcome {
+                Ok(document) => documents.push(document),
+                Err(failure) => failed.push(failure),
+            }
+        }
     }
 
-    Ok(results)
+    let partial = apply_virtual_member_failures(db, virtual_repo_id, format, path, &failed).await?;
+    Ok(VirtualMetadata { documents, partial })
 }
 
 /// Adapt a virtual-repo member [`Repository`] (as returned by
@@ -22185,6 +22530,11 @@ mod proxy_download_recording_tests {
         "proxy_fetch_streaming_with_cache_key_verified(",
         "proxy_fetch_streaming_response_with_cache_key(",
         "try_upstream_fetch_with_accept(",
+        // #4341: npm's direct-Remote tarball arm streams through the
+        // `ProxyService` method itself (the digest-flexible SRI gate has no
+        // `proxy_helpers` wrapper), so the gate has to name it or that arm is
+        // invisible to it.
+        "fetch_artifact_streaming_with_cache_path_gated_digest(",
     ];
 
     /// Calls that count as recording the serve. `try_remote_or_virtual_download`
@@ -22202,6 +22552,14 @@ mod proxy_download_recording_tests {
         // arms (the scanned 200 and the over-cap fail-open stream).
         "serve_scanned_proxy_file(",
     ];
+
+    /// Recorders that record THEIR OWN serve only (#4341). The scan-on-proxy
+    /// wrapper records the scanned 200 it builds, never the unscanned arm of
+    /// the function that calls it, so calling a function that wraps it does
+    /// not count as recording a serve the caller streams itself. Without this
+    /// the one-hop rule below let npm's unscanned direct-Remote tarball arm
+    /// pass because the same function also calls `serve_scanned_npm_tarball`.
+    const SELF_ONLY_RECORDERS: &[&str] = &["serve_scanned_proxy_file("];
 
     const MARKER: &str = "UNRECORDED-PROXY-SERVE:";
 
@@ -22290,9 +22648,16 @@ mod proxy_download_recording_tests {
                 let end = fns.get(i + 1).map(|(o, _)| *o).unwrap_or(src.len());
                 bodies.entry(name).or_default().push_str(&src[*off..end]);
             }
+            // Functions a one-hop caller or callee may lean on: those that
+            // record through something other than a self-only recorder.
             let recorders: Vec<&str> = bodies
                 .iter()
-                .filter(|(_, body)| RECORDERS.iter().any(|r| body.contains(r)))
+                .filter(|(_, body)| {
+                    RECORDERS
+                        .iter()
+                        .filter(|r| !SELF_ONLY_RECORDERS.contains(r))
+                        .any(|r| body.contains(r))
+                })
                 .map(|(name, _)| *name)
                 .collect();
 
@@ -22433,6 +22798,11 @@ mod proxy_download_recording_tests {
             ),
             // #4120 moved the Go module `.zip` download the same way.
             ("goproxy.rs", "proxy_fetch_streaming_with_format("),
+            // #4341: npm's direct-Remote tarball arm.
+            (
+                "npm.rs",
+                "fetch_artifact_streaming_with_cache_path_gated_digest(",
+            ),
         ] {
             let (_, src) = SERVE_SOURCES
                 .iter()
