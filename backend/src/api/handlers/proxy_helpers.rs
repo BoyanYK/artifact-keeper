@@ -6392,18 +6392,33 @@ pub(crate) async fn record_proxy_download_via(
         return;
     };
     let ip = ctx.client_ip.map(|i| i.to_string());
-    if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
-        db,
-        repo_id,
-        path,
-        &storage_key,
-        &metadata_key,
-        ctx.user_id,
-        ip.as_deref(),
-        ctx.user_agent.as_deref(),
-    )
-    .await
-    {
+    // #4551: an object served without any cache write (over the repository
+    // quota) gets no catalog placeholder; the download is still recorded,
+    // keyed on `(repository_id, path)` (#4539).
+    let recorded = if proxy.served_without_cache(repo_id, path) {
+        crate::services::proxy_catalog::record_uncached_proxy_download(
+            db,
+            repo_id,
+            path,
+            ctx.user_id,
+            ip.as_deref(),
+            ctx.user_agent.as_deref(),
+        )
+        .await
+    } else {
+        crate::services::proxy_catalog::record_proxy_download(
+            db,
+            repo_id,
+            path,
+            &storage_key,
+            &metadata_key,
+            ctx.user_id,
+            ip.as_deref(),
+            ctx.user_agent.as_deref(),
+        )
+        .await
+    };
+    if let Err(e) = recorded {
         tracing::debug!(
             repo_id = %repo_id,
             path = %path,
@@ -21952,7 +21967,7 @@ mod scan_on_upload_coverage_tests {
     /// The only sites allowed to opt out of quota admission with a
     /// `NO-QUOTA-ADMISSION:` reason (#4422 review): promotion copies, the
     /// generated Protobuf label index, proxy-cache fills, and OCI manifest rows
-    /// (charged 0 until #4545). A new exemption is a review conversation: it
+    /// (not counted by the usage ledger, #4545). A new exemption is a review conversation: it
     /// fails here until it is added to this list.
     const ISSUE_4422_EXEMPT_SITES: &[(&str, &str)] = &[
         ("approval.rs", "approve_promotion"),
