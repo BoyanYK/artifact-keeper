@@ -46,10 +46,19 @@ Every record has this stable, versioned shape:
 | `action` | string | SCREAMING_SNAKE action name (`LOGIN`, `REPOSITORY_CREATED`, …). |
 | `outcome` | enum | `success` \| `failure` \| `denied`, derived from the action name. |
 | `actor` | object | `{ id, name, type }` — see below. |
-| `source_ip` | string \| null | Source IP when the emitter already captures one; otherwise `null`. |
+| `source_ip` | string \| null | The request's verified client IP, for every action recorded while handling a request (see below); `null` for background jobs and when the address is not verified. Same value as the row's `ip_address`. |
 | `resource` | object | `{ type, id, name }` — the targeted resource. |
 | `correlation_id` | string | Joins to request logs and traces (#2414). Behind a gateway listed in `RATE_LIMIT_TRUSTED_PROXY_CIDRS` it is the gateway's `X-Request-ID` (#4677). |
 | `details` | object \| null | Typed for representative events (below); permissive otherwise. |
+
+`source_ip` (the `audit_log.ip_address` column) is populated for every action
+written while handling an HTTP request, not only authentication events
+(#4762). It is the address the client-IP resolution grades as verified
+(#3888, #4681): the TCP peer, or the `X-Forwarded-For`-derived address only
+when the peer is a trusted proxy and `XFF_TRUSTED_FOR_AUTHZ=true`. Behind a
+trusted proxy without that assertion, and for rows written by background
+jobs (janitors, schedulers, replication), it is `null`, never a guessed or
+client-supplied address.
 
 `actor.type` is one of `system`, `user`, `anonymous`, or the reserved
 `service_account` (not yet emitted). `actor.name` is best-effort — it is
@@ -65,13 +74,6 @@ For the password/session lifecycle events (`PASSWORD_CHANGED`,
 (the acting admin on an admin reset), while the `audit_log` row's `user_id`
 column keeps its established subject-keyed semantics — the stream does not
 change what the admin API returns.
-
-`source_ip` is deliberately nullable. Most authentication, permission, and
-token emitters do not currently capture the request address, so those events
-generally emit `null`; existing emitters such as artifact operations populate
-it when that context is already available. Client attribution across the wider
-request surface needs a considered trust model and is separate from this export
-contract.
 
 ## Examples
 
