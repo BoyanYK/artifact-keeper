@@ -857,9 +857,17 @@ pub struct Config {
     /// value fails startup.
     pub metrics_bind_ip: std::net::IpAddr,
 
-    /// Maximum number of connections in the PostgreSQL pool.
-    /// Defaults to 20. Increase for higher concurrency, decrease for
+    /// Maximum number of connections in the PostgreSQL pool, per replica.
+    /// Defaults to 50. Increase for higher concurrency, decrease for
     /// databases with restricted connection budgets (e.g., shared RDS).
+    ///
+    /// Size the whole fleet, not one replica (#4549):
+    /// `DATABASE_MAX_CONNECTIONS × replicas` + the single-flight lock/wait
+    /// connections held outside the pool (capped per replica by
+    /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`) + headroom for one
+    /// rolling-update surge replica must stay below Postgres
+    /// `max_connections`. The defaults give 3 × 50 = 150 against a stock
+    /// server's 100; see the Database section of `.env.example`.
     pub database_max_connections: u32,
 
     /// Minimum number of idle connections kept in the PostgreSQL pool.
@@ -969,6 +977,15 @@ pub struct Config {
     /// lifetime policy or when running behind a TCP load balancer with an
     /// idle disconnect.
     pub database_max_lifetime_secs: u64,
+
+    /// Arm server-side TCP keepalives (15 s idle, 5 s interval, 3 probes) on
+    /// every new pool connection with an `after_connect` `set_config` query
+    /// (#4549), so Postgres reaps a force-killed pod's sessions in about 30 s.
+    /// Defaults to `true`; `DATABASE_TCP_KEEPALIVES=false` (or `0`) skips the
+    /// hook. A failure of that query is logged once and never fails the
+    /// connection; a pooler in transaction mode may not carry the setting to
+    /// the server session that ends up serving a query.
+    pub database_tcp_keepalives: bool,
 
     /// Master on/off switch for HTTP rate limiting. When `false`, none of
     /// the per-IP / per-user rate-limit middleware layers are installed, so
@@ -1436,6 +1453,7 @@ redacted_debug!(Config {
     show database_acquire_timeout_secs,
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
+    show database_tcp_keepalives,
     show auth_max_concurrency,
     show global_max_concurrency,
     show global_request_timeout_secs,
@@ -1590,6 +1608,7 @@ impl Default for Config {
             database_acquire_timeout_secs: 5,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
+            database_tcp_keepalives: true,
             auth_max_concurrency: default_auth_max_concurrency(),
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
@@ -1951,6 +1970,12 @@ impl Config {
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
+            database_tcp_keepalives: !matches!(
+                env::var("DATABASE_TCP_KEEPALIVES")
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .as_deref(),
+                Ok("false" | "0" | "no" | "off")
+            ),
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
